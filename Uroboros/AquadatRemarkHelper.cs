@@ -252,12 +252,12 @@ PRAGMA wal_autocheckpoint=1000;";
                 .Trim();
         }
 
-        public static List<string> Extract4DigitNumbers(string? text)
+        public static List<string> Extract4Or5DigitNumbers(string? text)
         {
             if (string.IsNullOrWhiteSpace(text))
                 return new List<string>();
 
-            var matches = Regex.Matches(text, @"(?<!\d)\d{4}(?!\d)", RegexOptions.CultureInvariant);
+            var matches = Regex.Matches(text, @"(?<!\d)\d{4,5}(?!\d)", RegexOptions.CultureInvariant);
             return matches.Cast<Match>().Select(m => m.Value).ToList();
         }
 
@@ -275,7 +275,7 @@ PRAGMA wal_autocheckpoint=1000;";
 
             foreach (var line in lines)
             {
-                var numbers = Extract4DigitNumbers(line);
+                var numbers = Extract4Or5DigitNumbers(line);
 
                 if (line.Contains("รับ", StringComparison.Ordinal))
                     result.Values["Rec"].AddRange(numbers);

@@ -25,11 +25,11 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Google.Apis.Drive.v3;
+using LabImportCli;
 using Microsoft.Data.Sqlite;
 using Uroboros;
 using static Google.Apis.Requests.BatchRequest;
 using static Uroboros.AquadatFastCli;
-
 
 // ==============================
 // Scheduler model
@@ -333,6 +333,14 @@ public sealed class TaskRegistry
     }
 
     public IReadOnlyList<string> ListNames() => _map.Keys.OrderBy(x => x).ToList();
+}
+
+public sealed class LabImportResult
+{
+    public int InsertedRows { get; set; }
+    public string SourceFile { get; set; } = "";
+    public string SheetName { get; set; } = "";
+    public string ReportDate { get; set; } = "";
 }
 #endregion
 
@@ -1736,6 +1744,32 @@ public sealed class MdbDownloadTask : IEngineTask
     }
 }
 
+public sealed class LabImportTask : IEngineTask
+{
+    public TaskSpec Spec { get; } = new TaskSpec(
+        Name: "LAB.import.daily",
+        Group: "LAB",
+        Priority: TaskPriority.Normal,
+        Policy: RunPolicy.DropIfRunning,
+        Timeout: TimeSpan.FromMinutes(5)
+    );
+
+    public async Task ExecuteAsync(EngineContext ctx, CancellationToken ct)
+    {
+        var baseDir = AppContext.BaseDirectory;
+
+        var reportDate = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+        ctx.Log.Info($"[LAB] start import reportDate={reportDate}");
+
+        var result = await Task.Run(
+            () => LabImportCli.DailyLabImporter.ImportDaily(reportDate, baseDir),
+            ct
+        ).ConfigureAwait(false);
+
+        ctx.Log.Info($"[LAB] OK inserted={result.RowsWritten}, file='{result.ExcelPath}'");
+    }
+}
 #endregion
 
 #region WEB Listener
@@ -2475,6 +2509,7 @@ public static class Program
         reg.Register("DB_download.refresh", () => new DbDownloadTask());
         reg.Register("MDB_upload.refresh", () => new MdbUploadTask());
         reg.Register("MDB_download.refresh", () => new MdbDownloadTask());
+        reg.Register("LAB.import.daily", () => new LabImportTask());
 
         // NEW: config store/service
         var adminDb = Path.Combine(AppContext.BaseDirectory, "engine_admin.db");
@@ -2500,6 +2535,7 @@ public static class Program
             ("MDB_upload.refresh", () => new MdbUploadTask(), 30000),
             ("DB_download.refresh", () => new DbUploadTask(), 30000),
             ("MDB_download.refresh", () => new MdbDownloadTask(), 30000),
+            ("LAB.import.daily", () => new LabImportTask(), 30000) // 24 ชม.
         };
 
         using var stopCts = new CancellationTokenSource();
