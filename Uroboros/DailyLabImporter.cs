@@ -82,7 +82,8 @@ public static class DailyLabImporter
         string EquipmentName,
         string ParamName,
         string MeasureTh,
-        double? ValueReal);
+        double? ValueReal,
+        string? ValueText);
 
     public static ImportResult ImportDaily(string reportDateText, string? startupPath = null)
     {
@@ -123,102 +124,140 @@ public static class DailyLabImporter
         if (string.IsNullOrWhiteSpace(basePath))
             throw new InvalidOperationException("Missing Lab_file_location in config_/config.ini");
 
-        var excelPath = ResolveDailyLabExcelPath(basePath, reportDate);
-        var sheetName = reportDate.Day.ToString(CultureInfo.InvariantCulture);
+        // ใช้ 2 วันเสมอ: เมื่อวาน + วันนี้ (อิงจาก reportDate ที่ส่งเข้า)
+        var targetDates = new[]
+        {
+            reportDate.Date.AddDays(-1),
+            reportDate.Date
+        };
+
+        var rows = new List<LabValueRow>();
+        var excelPathsUsed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sheetNamesUsed = new List<string>();
+
+        foreach (var targetDate in targetDates)
+        {
+            var oneDayRows = ReadRowsFromSingleDate(
+                basePath,
+                targetDate,
+                mapping,
+                structureMap,
+                out var excelPath,
+                out var sheetName);
+
+            rows.AddRange(oneDayRows);
+            excelPathsUsed.Add(excelPath);
+            sheetNamesUsed.Add(sheetName);
+        }
+
+        UpsertIntoSqlite(dbPath, rows, targetDates);
+
+        return new ImportResult
+        {
+            ReportDateText = reportDateText,
+            ExcelPath = string.Join(" | ", excelPathsUsed),
+            SheetName = string.Join(" | ", sheetNamesUsed.Distinct()),
+            RowsWritten = rows.Count,
+            DistinctCfgCount = rows.Select(x => x.ConfigParamId).Distinct().Count()
+        };
+    }
+
+    private static List<LabValueRow> ReadRowsFromSingleDate(
+        string basePath,
+        DateTime targetDate,
+        LabMappingRoot mapping,
+        Dictionary<int, LabStructureItem> structureMap,
+        out string excelPath,
+        out string sheetName)
+    {
+        excelPath = ResolveDailyLabExcelPath(basePath, targetDate);
+        sheetName = targetDate.Day.ToString(CultureInfo.InvariantCulture);
+
+        var sheetNameLocal = sheetName;
 
         var rows = new List<LabValueRow>();
 
-        using (var workbook = new XLWorkbook(excelPath))
+        using var workbook = new XLWorkbook(excelPath);
+
+        var worksheet = workbook.Worksheets
+            .FirstOrDefault(x => string.Equals(x.Name.Trim(), sheetNameLocal, StringComparison.OrdinalIgnoreCase));
+
+        if (worksheet is null)
+            throw new InvalidOperationException($"Sheet not found for day: {sheetNameLocal}, file: {excelPath}");
+
+        foreach (var block in mapping.blocks ?? Enumerable.Empty<LabMappingBlock>())
         {
-            var worksheet = workbook.Worksheets
-                .FirstOrDefault(x => string.Equals(x.Name.Trim(), sheetName, StringComparison.OrdinalIgnoreCase));
+            var times = BuildFixedTimes(block.time);
 
-            if (worksheet is null)
-                throw new InvalidOperationException($"Sheet not found for day: {sheetName}");
-
-            foreach (var block in mapping.blocks ?? Enumerable.Empty<LabMappingBlock>())
+            foreach (var mapItem in block.mappings ?? Enumerable.Empty<LabMappingItem>())
             {
-                var times = BuildFixedTimes(block.time);
+                if (mapItem.cfg <= 0)
+                    continue;
 
-                foreach (var mapItem in block.mappings ?? Enumerable.Empty<LabMappingItem>())
+                structureMap.TryGetValue(mapItem.cfg, out var meta);
+                var equipmentName = SafeText(meta?.equipment_name);
+                var paramName = SafeText(meta?.Param_name);
+                var measureTh = SafeText(meta?.measure_th);
+
+                if (mapItem.points is { Count: > 0 })
                 {
-                    if (mapItem.cfg <= 0)
-                        continue;
-
-                    structureMap.TryGetValue(mapItem.cfg, out var meta);
-                    var equipmentName = SafeText(meta?.equipment_name);
-                    var paramName = SafeText(meta?.Param_name);
-                    var measureTh = SafeText(meta?.measure_th);
-
-                    if (mapItem.points is { Count: > 0 })
+                    foreach (var pt in mapItem.points)
                     {
-                        foreach (var pt in mapItem.points)
+                        if (!TryParseTimeSpan(pt.time, out var ts) || string.IsNullOrWhiteSpace(pt.cell))
+                            continue;
+
+                        var sampleDate = targetDate.Date;
+                        if (ts >= TimeSpan.FromHours(24))
                         {
-                            if (!TryParseTimeSpan(pt.time, out var ts) || string.IsNullOrWhiteSpace(pt.cell))
-                                continue;
-
-                            var sampleDate = reportDate.Date;
-                            if (ts >= TimeSpan.FromHours(24))
-                            {
-                                sampleDate = sampleDate.AddDays(ts.Days);
-                                ts = new TimeSpan(ts.Hours, ts.Minutes, 0);
-                            }
-
-                            var cellRef = pt.cell.Trim();
-                            var cellValue = GetCellValueSafe(worksheet, cellRef);
-
-                            rows.Add(CreateRow(
-                                sampleDate,
-                                ts,
-                                mapItem.cfg,
-                                equipmentName,
-                                paramName,
-                                measureTh,
-                                cellValue));
+                            sampleDate = sampleDate.AddDays(ts.Days);
+                            ts = new TimeSpan(ts.Hours, ts.Minutes, 0);
                         }
+
+                        var cellRef = pt.cell.Trim();
+                        var cellValue = GetCellValueSafe(worksheet, cellRef);
+
+                        rows.Add(CreateRow(
+                            sampleDate,
+                            ts,
+                            mapItem.cfg,
+                            equipmentName,
+                            paramName,
+                            measureTh,
+                            cellValue));
                     }
-                    else if (mapItem.cell_series is not null && times.Count > 0)
+                }
+                else if (mapItem.cell_series is not null && times.Count > 0)
+                {
+                    var cells = BuildCellSeries(mapItem.cell_series);
+                    var count = Math.Min(times.Count, cells.Count);
+
+                    for (var i = 0; i < count; i++)
                     {
-                        var cells = BuildCellSeries(mapItem.cell_series);
-                        var count = Math.Min(times.Count, cells.Count);
-
-                        for (var i = 0; i < count; i++)
+                        var ts = times[i];
+                        var sampleDate = targetDate.Date;
+                        if (ts >= TimeSpan.FromHours(24))
                         {
-                            var ts = times[i];
-                            var sampleDate = reportDate.Date;
-                            if (ts >= TimeSpan.FromHours(24))
-                            {
-                                sampleDate = sampleDate.AddDays(ts.Days);
-                                ts = new TimeSpan(ts.Hours, ts.Minutes, 0);
-                            }
-
-                            var cellRef = cells[i];
-                            var cellValue = GetCellValueSafe(worksheet, cellRef);
-
-                            rows.Add(CreateRow(
-                                sampleDate,
-                                ts,
-                                mapItem.cfg,
-                                equipmentName,
-                                paramName,
-                                measureTh,
-                                cellValue));
+                            sampleDate = sampleDate.AddDays(ts.Days);
+                            ts = new TimeSpan(ts.Hours, ts.Minutes, 0);
                         }
+
+                        var cellRef = cells[i];
+                        var cellValue = GetCellValueSafe(worksheet, cellRef);
+
+                        rows.Add(CreateRow(
+                            sampleDate,
+                            ts,
+                            mapItem.cfg,
+                            equipmentName,
+                            paramName,
+                            measureTh,
+                            cellValue));
                     }
                 }
             }
         }
 
-        UpsertIntoSqlite(dbPath, rows, reportDate);
-
-        return new ImportResult
-        {
-            ReportDateText = reportDateText,
-            ExcelPath = excelPath,
-            SheetName = sheetName,
-            RowsWritten = rows.Count,
-            DistinctCfgCount = rows.Select(x => x.ConfigParamId).Distinct().Count()
-        };
+        return rows;
     }
 
     private static LabValueRow CreateRow(
@@ -231,6 +270,7 @@ public static class DailyLabImporter
         object? value)
     {
         double? valueReal = null;
+        string? valueText = null;
 
         if (value is not null)
         {
@@ -238,21 +278,38 @@ public static class DailyLabImporter
             {
                 case double d:
                     valueReal = d;
+                    valueText = d.ToString(CultureInfo.InvariantCulture);
                     break;
+
                 case decimal m:
                     valueReal = (double)m;
+                    valueText = m.ToString(CultureInfo.InvariantCulture);
                     break;
+
                 case int i:
                     valueReal = i;
+                    valueText = i.ToString(CultureInfo.InvariantCulture);
                     break;
+
                 case long l:
                     valueReal = l;
+                    valueText = l.ToString(CultureInfo.InvariantCulture);
                     break;
+
                 default:
                     {
-                        var valueText = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim();
-                        if (double.TryParse(valueText, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsed))
-                            valueReal = parsed;
+                        var rawText = Convert.ToString(value, CultureInfo.InvariantCulture)?.Trim();
+
+                        if (!string.IsNullOrWhiteSpace(rawText))
+                        {
+                            valueText = rawText;
+
+                            if (double.TryParse(rawText, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsedInvariant))
+                                valueReal = parsedInvariant;
+                            else if (double.TryParse(rawText, NumberStyles.Any, CultureInfo.CurrentCulture, out var parsedCurrent))
+                                valueReal = parsedCurrent;
+                        }
+
                         break;
                     }
             }
@@ -265,10 +322,11 @@ public static class DailyLabImporter
             equipmentName,
             paramName,
             measureTh,
-            valueReal);
+            valueReal,
+            valueText);
     }
 
-    private static void UpsertIntoSqlite(string dbPath, IReadOnlyList<LabValueRow> rows, DateTime reportDate)
+    private static void UpsertIntoSqlite(string dbPath, IReadOnlyList<LabValueRow> rows, IReadOnlyList<DateTime> targetDates)
     {
         var cs = new SqliteConnectionStringBuilder
         {
@@ -289,9 +347,7 @@ public static class DailyLabImporter
         using (var create = conn.CreateCommand())
         {
             create.CommandText = @"
-DROP TABLE IF EXISTS lab_import_daily;
-
-CREATE TABLE lab_import_daily (
+CREATE TABLE IF NOT EXISTS lab_import_daily (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_date    TEXT    NOT NULL,
     sample_time    TEXT    NOT NULL,
@@ -299,7 +355,8 @@ CREATE TABLE lab_import_daily (
     equipment_name TEXT    NULL,
     param_name     TEXT    NULL,
     measure_th     TEXT    NULL,
-    value_real     REAL    NULL
+    value_real     REAL    NULL,
+    value_text     TEXT    NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_lab_import_daily_cfg_dt
@@ -308,8 +365,58 @@ CREATE INDEX IF NOT EXISTS ix_lab_import_daily_cfg_dt
             create.ExecuteNonQuery();
         }
 
+        using (var ensureColumn = conn.CreateCommand())
+        {
+            ensureColumn.CommandText = @"
+ALTER TABLE lab_import_daily ADD COLUMN value_text TEXT NULL;
+";
+            try
+            {
+                ensureColumn.ExecuteNonQuery();
+            }
+            catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
+            {
+                // มีคอลัมน์นี้แล้ว
+            }
+        }
+
+        var dateTexts = targetDates
+            .Select(x => x.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
+            .Distinct()
+            .ToArray();
+
+        if (dateTexts.Length != 2)
+            throw new InvalidOperationException("Expected exactly 2 target dates.");
+
         using var tx = conn.BeginTransaction();
 
+        // 1) ลบทุกอย่างที่ไม่ใช่ 2 วันที่ต้องเก็บ
+        using (var deleteOthers = conn.CreateCommand())
+        {
+            deleteOthers.Transaction = tx;
+            deleteOthers.CommandText = @"
+DELETE FROM lab_import_daily
+WHERE sample_date NOT IN ($d1, $d2);
+";
+            deleteOthers.Parameters.AddWithValue("$d1", dateTexts[0]);
+            deleteOthers.Parameters.AddWithValue("$d2", dateTexts[1]);
+            deleteOthers.ExecuteNonQuery();
+        }
+
+        // 2) ลบข้อมูลของ 2 วันนี้ก่อน เพื่อ insert ใหม่แบบ clean
+        using (var deleteTargets = conn.CreateCommand())
+        {
+            deleteTargets.Transaction = tx;
+            deleteTargets.CommandText = @"
+DELETE FROM lab_import_daily
+WHERE sample_date IN ($d1, $d2);
+";
+            deleteTargets.Parameters.AddWithValue("$d1", dateTexts[0]);
+            deleteTargets.Parameters.AddWithValue("$d2", dateTexts[1]);
+            deleteTargets.ExecuteNonQuery();
+        }
+
+        // 3) insert ใหม่
         using var insert = conn.CreateCommand();
         insert.Transaction = tx;
         insert.CommandText = @"
@@ -320,7 +427,8 @@ INSERT INTO lab_import_daily (
     equipment_name,
     param_name,
     measure_th,
-    value_real
+    value_real,
+    value_text
 )
 VALUES (
     $sample_date,
@@ -329,7 +437,8 @@ VALUES (
     $equipment_name,
     $param_name,
     $measure_th,
-    $value_real
+    $value_real,
+    $value_text
 );
 ";
 
@@ -340,6 +449,7 @@ VALUES (
         var pParam = insert.Parameters.Add("$param_name", SqliteType.Text);
         var pMeasure = insert.Parameters.Add("$measure_th", SqliteType.Text);
         var pReal = insert.Parameters.Add("$value_real", SqliteType.Real);
+        var pText = insert.Parameters.Add("$value_text", SqliteType.Text);
 
         foreach (var row in rows)
         {
@@ -350,6 +460,7 @@ VALUES (
             pParam.Value = DbValue(row.ParamName);
             pMeasure.Value = DbValue(row.MeasureTh);
             pReal.Value = row.ValueReal.HasValue ? row.ValueReal.Value : DBNull.Value;
+            pText.Value = DbValue(row.ValueText);
             insert.ExecuteNonQuery();
         }
 

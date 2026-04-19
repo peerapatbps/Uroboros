@@ -516,8 +516,8 @@ public sealed class Chem1RefreshTask : IEngineTask
     public async Task ExecuteAsync(EngineContext ctx, CancellationToken ct)
     {
         var url = "http://172.17.198.20/cgi-bin/ope/allch.cgi";
-        var rows = new List<int> { 10, 11 };
-        var types = new List<string> { "value", "value" };
+        var rows = new List<int> { 10, 11, 0, 1, 2, 3, 4, 5 };
+        var types = new List<string> { "value", "value", "value", "value", "value", "value", "value", "value" };
 
         var r = await HtmlHookClient
             .FetchChannelDataAsync(url, rows, types, ct)
@@ -528,11 +528,24 @@ public sealed class Chem1RefreshTask : IEngineTask
 
         var w1Val = HtmlHookClient.GetItem2(r, 0);
         var w2Val = HtmlHookClient.GetItem2(r, 1);
+        var w3Val = HtmlHookClient.GetItem2(r, 2);
+        var w4Val = HtmlHookClient.GetItem2(r, 3);
+        var w5Val = HtmlHookClient.GetItem2(r, 4);
+        var w6Val = HtmlHookClient.GetItem2(r, 5);
+        var w7Val = HtmlHookClient.GetItem2(r, 6);
+        var w8Val = HtmlHookClient.GetItem2(r, 7);
+        var w9Val = HtmlHookClient.GetItem2(r, 8);
 
         var payload = new List<(string Param, string? ValueText, string? Unit)>();
 
         HtmlHookClient.AddIfValid(payload, "cl_lineA", w1Val);
         HtmlHookClient.AddIfValid(payload, "cl_lineB", w2Val);
+        HtmlHookClient.AddIfValid(payload, "cl_D1", w3Val);
+        HtmlHookClient.AddIfValid(payload, "cl_D2", w4Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S1", w5Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S2", w6Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S3", w7Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S4", w8Val);
 
         if (payload.Count > 0)
         {
@@ -562,8 +575,8 @@ public sealed class Chem2RefreshTask : IEngineTask
     public async Task ExecuteAsync(EngineContext ctx, CancellationToken ct)
     {
         var url = "http://172.17.198.21/cgi-bin/ope/allch.cgi";
-        var rows = new List<int> { 10, 11 };
-        var types = new List<string> { "value", "value" };
+        var rows = new List<int> { 10, 11, 0, 1, 2, 3, 4, 5 };
+        var types = new List<string> { "value", "value", "value", "value", "value", "value", "value", "value" };
 
         var r = await HtmlHookClient
             .FetchChannelDataAsync(url, rows, types, ct)
@@ -572,13 +585,26 @@ public sealed class Chem2RefreshTask : IEngineTask
         if (r == null || r.Count < 2)
             throw new Exception("CHEM2 response insufficient.");
 
-        var w3Val = HtmlHookClient.GetItem2(r, 0);
-        var w4Val = HtmlHookClient.GetItem2(r, 1);
+        var w1Val = HtmlHookClient.GetItem2(r, 0);
+        var w2Val = HtmlHookClient.GetItem2(r, 1);
+        var w3Val = HtmlHookClient.GetItem2(r, 2);
+        var w4Val = HtmlHookClient.GetItem2(r, 3);
+        var w5Val = HtmlHookClient.GetItem2(r, 4);
+        var w6Val = HtmlHookClient.GetItem2(r, 5);
+        var w7Val = HtmlHookClient.GetItem2(r, 6);
+        var w8Val = HtmlHookClient.GetItem2(r, 7);
+        var w9Val = HtmlHookClient.GetItem2(r, 8);
 
         var payload = new List<(string Param, string? ValueText, string? Unit)>();
 
-        HtmlHookClient.AddIfValid(payload, "cl_lineC", w3Val);
-        HtmlHookClient.AddIfValid(payload, "cl_lineD", w4Val);
+        HtmlHookClient.AddIfValid(payload, "cl_lineC", w1Val);
+        HtmlHookClient.AddIfValid(payload, "cl_lineD", w2Val);
+        HtmlHookClient.AddIfValid(payload, "cl_D1", w3Val);
+        HtmlHookClient.AddIfValid(payload, "cl_D2", w4Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S1", w5Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S2", w6Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S3", w7Val);
+        HtmlHookClient.AddIfValid(payload, "cl_S4", w8Val);
 
         if (payload.Count > 0)
         {
@@ -2401,6 +2427,19 @@ public sealed class WebListener
                     return;
                 }
             }
+
+            if (path.Equals("/api/cldetector/summary", StringComparison.OrdinalIgnoreCase))
+            {
+                await ClDetectorHandlers.HandleClDetectorSummaryAsync(hc, _ctx, ct);
+                return;
+            }
+
+            if (req.HttpMethod == "POST" && path == "/api/lab/summary")
+            {
+                await LabSummaryModule.HandlePostAsync(hc, _jsonOpt, ct).ConfigureAwait(false);
+                return;
+            }
+
             await WriteJsonAsync(hc, 404, new { ok = false, error = "Not found", path });
         }
         catch (Exception ex)
