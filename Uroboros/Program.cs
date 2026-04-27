@@ -17,6 +17,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -24,6 +25,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using System.Diagnostics;
 using Google.Apis.Drive.v3;
 using LabImportCli;
 using Microsoft.Data.Sqlite;
@@ -1862,6 +1864,17 @@ public sealed class WebListener
             _http.Start();
             _ctx.Log.Info($"[HTTP] Listening at {string.Join(", ", _http.Prefixes)}");
         }
+        catch (HttpListenerException ex) when (ex.ErrorCode == 183)
+        {
+            var prefix = _http.Prefixes.FirstOrDefault() ?? "(unknown)";
+            var conflict = HttpPortDiagnostics.DescribeConflict(prefix);
+            var message = conflict is null
+                ? $"[HTTP] Start failed: prefix '{prefix}' is already in use. Stop the other instance or set UROBOROS_HTTP_PREFIX."
+                : $"[HTTP] Start failed: prefix '{prefix}' is already in use by {conflict}. Stop the other instance or set UROBOROS_HTTP_PREFIX.";
+
+            _ctx.Log.Error(ex, message);
+            throw new InvalidOperationException(message, ex);
+        }
         catch (Exception ex)
         {
             _ctx.Log.Error(ex, "[HTTP] Start failed");
@@ -2506,6 +2519,69 @@ public sealed class WebListener
         return new SqliteUpperLowerProvider(dbPath);
     }
 }
+
+internal static class HttpPortDiagnostics
+{
+    public static string? DescribeConflict(string prefix)
+    {
+        try
+        {
+            var uri = new Uri(prefix);
+            var port = uri.Port;
+            if (port <= 0) return null;
+
+            var listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
+            if (!listeners.Any(ep => ep.Port == port))
+                return null;
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = "http show servicestate",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc is null) return $"another HTTP.sys listener on port {port}";
+
+            var output = proc.StandardOutput.ReadToEnd();
+            proc.WaitForExit(3000);
+
+            var lines = output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (!lines[i].Contains($":{port}/", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string? processId = null;
+                string? service = null;
+
+                for (var j = i; j < Math.Min(i + 20, lines.Length); j++)
+                {
+                    var trimmed = lines[j].Trim();
+                    if (trimmed.StartsWith("ID:", StringComparison.OrdinalIgnoreCase))
+                        processId = trimmed["ID:".Length..].Split(',')[0].Trim();
+                    else if (trimmed.StartsWith("Services:", StringComparison.OrdinalIgnoreCase))
+                        service = trimmed["Services:".Length..].Trim();
+                }
+
+                if (!string.IsNullOrWhiteSpace(service) && !string.IsNullOrWhiteSpace(processId))
+                    return $"process {processId} ({service}) on port {port}";
+                if (!string.IsNullOrWhiteSpace(processId))
+                    return $"process {processId} on port {port}";
+            }
+
+            return $"another HTTP.sys listener on port {port}";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
 #endregion
 
 #region MAIN_PROGRAM
@@ -2598,7 +2674,11 @@ public static class Program
 
         // Web listener
         var _aq = new AqFastApiReal();
-        var http = new WebListener(ctx, sched, gate, reg, _aq, cfgSvc, health, nextRun, "http://+:8888/");
+        var httpPrefix = Environment.GetEnvironmentVariable("UROBOROS_HTTP_PREFIX");
+        if (string.IsNullOrWhiteSpace(httpPrefix))
+            httpPrefix = "http://+:8888/";
+
+        var http = new WebListener(ctx, sched, gate, reg, _aq, cfgSvc, health, nextRun, httpPrefix);
         var httpTask = http.RunAsync(stopCts.Token);
 
         // Trigger loop (Keep phase + hot config)
