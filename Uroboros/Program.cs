@@ -131,7 +131,17 @@ public sealed class Scheduler
 
     public bool TryEnqueue(IEngineTask task)
     {
-        if (_gate.IsPaused) return false;
+        return TryEnqueueCore(task, ignorePauseGate: false);
+    }
+
+    public bool TryEnqueueManual(IEngineTask task)
+    {
+        return TryEnqueueCore(task, ignorePauseGate: true);
+    }
+
+    private bool TryEnqueueCore(IEngineTask task, bool ignorePauseGate)
+    {
+        if (!ignorePauseGate && _gate.IsPaused) return false;
 
         var spec = task.Spec;
 
@@ -1819,10 +1829,11 @@ public sealed class WebListener
     private readonly TaskHealthTracker _health;
     private readonly NextRunTracker _nextRun;
     private readonly IPtcSeriesProvider _ptc;
+    private readonly WayfarerIntegration _wayfarer;
     public WebListener(
         EngineContext ctx, Scheduler sched, StageGate gate, TaskRegistry reg,
         AqApiModule.IAqFastApi aq, TaskConfigService cfg, TaskHealthTracker health,
-        NextRunTracker nextRun, IPtcSeriesProvider ptc, string prefix)
+        NextRunTracker nextRun, IPtcSeriesProvider ptc, WayfarerIntegration wayfarer, string prefix)
     {
         _ctx = ctx ?? throw new ArgumentNullException(nameof(ctx));
         _sched = sched ?? throw new ArgumentNullException(nameof(sched));
@@ -1833,6 +1844,7 @@ public sealed class WebListener
         _cfg = cfg;
         _health = health;
         _nextRun = nextRun;
+        _wayfarer = wayfarer ?? throw new ArgumentNullException(nameof(wayfarer));
 
         if (string.IsNullOrWhiteSpace(prefix))
             throw new ArgumentException("prefix is required", nameof(prefix));
@@ -1843,10 +1855,10 @@ public sealed class WebListener
     public WebListener(
     EngineContext ctx, Scheduler sched, StageGate gate, TaskRegistry reg,
     AqApiModule.IAqFastApi aq, TaskConfigService cfg, TaskHealthTracker health,
-    NextRunTracker nextRun, string prefix
+    NextRunTracker nextRun, WayfarerIntegration wayfarer, string prefix
 )
     : this(ctx, sched, gate, reg, aq, cfg, health, nextRun,
-           CreateDefaultPtcProvider(), prefix)
+           CreateDefaultPtcProvider(), wayfarer, prefix)
     {
     }
 
@@ -1925,6 +1937,23 @@ public sealed class WebListener
                 ApplyCors(hc.Response);
                 hc.Response.StatusCode = 204;
                 hc.Response.OutputStream.Close();
+                return;
+            }
+
+            if (await WayfarerApiHandler.TryHandleAsync(
+                hc,
+                _ctx,
+                _sched,
+                _reg,
+                _cfg,
+                _health,
+                _nextRun,
+                _wayfarer,
+                _jsonOpt,
+                WriteJsonAsync,
+                ReadBodyAsync,
+                ct).ConfigureAwait(false))
+            {
                 return;
             }
 
@@ -2605,6 +2634,7 @@ public static class Program
         // NEW: health + nextRun
         var health = new TaskHealthTracker();
         var nextRun = new NextRunTracker();
+        var wayfarer = WayfarerIntegration.LoadFromAppSettings(AppContext.BaseDirectory, ctx.Log);
 
         // registry
         var reg = new TaskRegistry();
@@ -2625,6 +2655,7 @@ public static class Program
         reg.Register("MDB_upload.refresh", () => new MdbUploadTask());
         reg.Register("MDB_download.refresh", () => new MdbDownloadTask());
         reg.Register("LAB.import.daily", () => new LabImportTask());
+        reg.Register(WayfarerConstants.TaskName, () => new WayfarerPmCollectTask(wayfarer));
 
         // NEW: config store/service
         var adminDb = Path.Combine(AppContext.BaseDirectory, "engine_admin.db");
@@ -2650,11 +2681,14 @@ public static class Program
             ("MDB_upload.refresh", () => new MdbUploadTask(), 30000),
             ("DB_download.refresh", () => new DbUploadTask(), 30000),
             ("MDB_download.refresh", () => new MdbDownloadTask(), 30000),
-            ("LAB.import.daily", () => new LabImportTask(), 30000) // 24 ชม.
+            ("LAB.import.daily", () => new LabImportTask(), 30000), // 24 ชม.
+            (WayfarerConstants.TaskName, () => new WayfarerPmCollectTask(wayfarer), WayfarerConstants.DefaultIntervalMs)
         };
 
         using var stopCts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; stopCts.Cancel(); };
+
+        await wayfarer.EnsureSchedulerTaskRowAsync(Path.Combine(AppContext.BaseDirectory, "data.db"), stopCts.Token);
 
         // init config (seed defaults if missing) + publish snapshot
         await cfgSvc.InitializeAsync(
@@ -2678,7 +2712,7 @@ public static class Program
         if (string.IsNullOrWhiteSpace(httpPrefix))
             httpPrefix = "http://+:8888/";
 
-        var http = new WebListener(ctx, sched, gate, reg, _aq, cfgSvc, health, nextRun, httpPrefix);
+        var http = new WebListener(ctx, sched, gate, reg, _aq, cfgSvc, health, nextRun, wayfarer, httpPrefix);
         var httpTask = http.RunAsync(stopCts.Token);
 
         // Trigger loop (Keep phase + hot config)
