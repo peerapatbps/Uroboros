@@ -89,6 +89,8 @@ public static class DailyLabImporter
     {
         startupPath ??= AppContext.BaseDirectory;
         var startup = Path.GetFullPath(startupPath);
+        var mediaDir = Path.Combine(startup, "media");
+        Directory.CreateDirectory(mediaDir);
 
         if (!DateTime.TryParseExact(
                 reportDateText.Trim(),
@@ -124,7 +126,7 @@ public static class DailyLabImporter
         if (string.IsNullOrWhiteSpace(basePath))
             throw new InvalidOperationException("Missing Lab_file_location in config_/config.ini");
 
-        // „™È 2 «—π‡ ¡Õ: ‡¡◊ËÕ«“π + «—ππ’È (Õ‘ß®“° reportDate ∑’Ë Ëß‡¢È“)
+        // ‡πÉ‡∏ä‡πâ 2 ‡∏ß‡∏±‡∏ô‡πÄ‡∏™‡∏°‡∏≠: ‡πÄ‡∏°‡∏∑‡πà‡∏≠‡∏ß‡∏≤‡∏ô + ‡∏ß‡∏±‡∏ô‡∏ô‡∏µ‡πâ (‡∏≠‡∏¥‡∏á‡∏à‡∏≤‡∏Å reportDate ‡∏ó‡∏µ‡πà‡∏™‡πà‡∏á‡πÄ‡∏Ç‡πâ‡∏≤)
         var targetDates = new[]
         {
             reportDate.Date.AddDays(-1),
@@ -139,6 +141,7 @@ public static class DailyLabImporter
         {
             var oneDayRows = ReadRowsFromSingleDate(
                 basePath,
+                mediaDir,
                 targetDate,
                 mapping,
                 structureMap,
@@ -164,13 +167,15 @@ public static class DailyLabImporter
 
     private static List<LabValueRow> ReadRowsFromSingleDate(
         string basePath,
+        string mediaDir,
         DateTime targetDate,
         LabMappingRoot mapping,
         Dictionary<int, LabStructureItem> structureMap,
         out string excelPath,
         out string sheetName)
     {
-        excelPath = ResolveDailyLabExcelPath(basePath, targetDate);
+        var sourceExcelPath = ResolveDailyLabExcelPath(basePath, targetDate);
+        excelPath = StageDailyLabExcelToMedia(sourceExcelPath, mediaDir);
         sheetName = targetDate.Day.ToString(CultureInfo.InvariantCulture);
 
         var sheetNameLocal = sheetName;
@@ -376,7 +381,7 @@ ALTER TABLE lab_import_daily ADD COLUMN value_text TEXT NULL;
             }
             catch (SqliteException ex) when (ex.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase))
             {
-                // ¡’§Õ≈—¡πÏπ’È·≈È«
+                // ‡∏°‡∏µ‡∏Ñ‡∏≠‡∏•‡∏±‡∏°‡∏ô‡πå‡∏ô‡∏µ‡πâ‡πÅ‡∏•‡πâ‡∏ß
             }
         }
 
@@ -390,7 +395,7 @@ ALTER TABLE lab_import_daily ADD COLUMN value_text TEXT NULL;
 
         using var tx = conn.BeginTransaction();
 
-        // 1) ≈∫∑ÿ°Õ¬Ë“ß∑’Ë‰¡Ë„™Ë 2 «—π∑’ËµÈÕß‡°Á∫
+        // 1) ‡∏•‡∏ö‡∏ó‡∏∏‡∏Å‡∏≠‡∏¢‡πà‡∏≤‡∏á‡∏ó‡∏µ‡πà‡πÑ‡∏°‡πà‡πÉ‡∏ä‡πà 2 ‡∏ß‡∏±‡∏ô‡∏ó‡∏µ‡πà‡∏ï‡πâ‡∏≠‡∏á‡πÄ‡∏Å‡πá‡∏ö
         using (var deleteOthers = conn.CreateCommand())
         {
             deleteOthers.Transaction = tx;
@@ -403,7 +408,7 @@ WHERE sample_date NOT IN ($d1, $d2);
             deleteOthers.ExecuteNonQuery();
         }
 
-        // 2) ≈∫¢ÈÕ¡Ÿ≈¢Õß 2 «—ππ’È°ËÕπ ‡æ◊ËÕ insert „À¡Ë·∫∫ clean
+        // 2) ‡∏•‡∏ö‡∏Ç‡πâ‡∏≠‡∏°‡∏π‡∏•‡∏Ç‡∏≠‡∏á 2 ‡∏ß‡∏±‡∏ô‡∏ô‡∏µ‡πâ‡∏Å‡πà‡∏≠‡∏ô ‡πÄ‡∏û‡∏∑‡πà‡∏≠ insert ‡πÉ‡∏´‡∏°‡πà‡πÅ‡∏ö‡∏ö clean
         using (var deleteTargets = conn.CreateCommand())
         {
             deleteTargets.Transaction = tx;
@@ -416,7 +421,7 @@ WHERE sample_date IN ($d1, $d2);
             deleteTargets.ExecuteNonQuery();
         }
 
-        // 3) insert „À¡Ë
+        // 3) insert ‡πÉ‡∏´‡∏°‡πà
         using var insert = conn.CreateCommand();
         insert.Transaction = tx;
         insert.CommandText = @"
@@ -602,6 +607,8 @@ VALUES (
 
         var candidates = new[]
         {
+            Path.Combine(basePath, $"{date.Month:00}DailyLab_{monthAbbr}{buddhistYear2}.xlsm"),
+            Path.Combine(basePath, $"{date.Month}DailyLab_{monthAbbr}{buddhistYear2}.xlsm"),
             Path.Combine(basePath, $"{date.Month:00}DailyLab_{monthAbbr}{buddhistYear2}.xlsx"),
             Path.Combine(basePath, $"{date.Month}DailyLab_{monthAbbr}{buddhistYear2}.xlsx")
         };
@@ -614,6 +621,42 @@ VALUES (
 
         throw new FileNotFoundException(
             $"LAB excel file not found. Tried: {string.Join(" | ", candidates)}");
+    }
+
+    private static string StageDailyLabExcelToMedia(string sourcePath, string mediaDir)
+    {
+        Directory.CreateDirectory(mediaDir);
+
+        var fileName = Path.GetFileName(sourcePath);
+        var targetPath = Path.Combine(mediaDir, fileName);
+        var tempPath = Path.Combine(mediaDir, $"{fileName}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            using (var src = new FileStream(
+                sourcePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete))
+            using (var dst = new FileStream(
+                tempPath,
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None))
+            {
+                src.CopyTo(dst);
+                dst.Flush(true);
+            }
+
+            File.Move(tempPath, targetPath, true);
+            return targetPath;
+        }
+        catch
+        {
+            if (File.Exists(tempPath))
+                File.Delete(tempPath);
+            throw;
+        }
     }
 
     private static string SafeText(string? value)

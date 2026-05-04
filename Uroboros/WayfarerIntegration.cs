@@ -366,11 +366,18 @@ public sealed class WayfarerIntegration
     {
         if (!string.IsNullOrWhiteSpace(_options.ExecutablePath) && File.Exists(_options.ExecutablePath))
         {
-            var exe = _options.ExecutablePath;
+            var executablePath = _options.ExecutablePath;
             var workDir = !string.IsNullOrWhiteSpace(_options.WorkingDirectory)
                 ? _options.WorkingDirectory
-                : Path.GetDirectoryName(exe)!;
-            return (exe, "", workDir, Quote(exe));
+                : Path.GetDirectoryName(executablePath)!;
+
+            if (string.Equals(Path.GetExtension(executablePath), ".dll", StringComparison.OrdinalIgnoreCase))
+            {
+                var args = Quote(executablePath);
+                return ("dotnet", args, workDir, $"dotnet {args}");
+            }
+
+            return (executablePath, "", workDir, Quote(executablePath));
         }
 
         if (!string.IsNullOrWhiteSpace(_options.ProjectPath))
@@ -554,11 +561,12 @@ public sealed record WayfarerListResponse(
 );
 
 public sealed record WayfarerStatusFilter(string? Code, string? Name);
+public sealed record WayfarerTypeFilter(string? Code, string? Name);
 public sealed record WayfarerDeptFilter(string? Code, string? Name);
 
 public sealed record WayfarerFilterResponse(
     IReadOnlyList<WayfarerStatusFilter> Statuses,
-    IReadOnlyList<string> Types,
+    IReadOnlyList<WayfarerTypeFilter> Types,
     IReadOnlyList<WayfarerDeptFilter> Departments,
     string? LatestFetchedAtUtc
 );
@@ -647,9 +655,7 @@ public static class WayfarerApiHandler
         {
             await using var conn = integration.OpenReadOnlyConnection();
             var statuses = await ReadStatusFiltersAsync(conn, ct).ConfigureAwait(false);
-            var types = await ReadScalarListAsync<string>(conn,
-                "SELECT DISTINCT wo_type_code FROM pm_wo_index WHERE wo_type_code IS NOT NULL AND wo_type_code <> '' ORDER BY wo_type_code",
-                ct).ConfigureAwait(false);
+            var types = await ReadTypeFiltersAsync(integration, ct).ConfigureAwait(false);
             var departments = await ReadDeptFiltersAsync(integration, conn, ct).ConfigureAwait(false);
 
             await using var latestCmd = conn.CreateCommand();
@@ -671,6 +677,8 @@ public static class WayfarerApiHandler
             var orderBy = BuildOrderBy(query["sort"], query["dir"]);
 
             await using var conn = integration.OpenReadOnlyConnection();
+            await AttachMetaDbAsync(conn, integration, ct).ConfigureAwait(false);
+
             var total = await CountAsync(conn, where, parameters, ct).ConfigureAwait(false);
             var summary = await SummaryAsync(conn, where, parameters, ct).ConfigureAwait(false);
             var items = await ListAsync(conn, where, parameters, orderBy, pageSize, offset, ct).ConfigureAwait(false);
@@ -689,6 +697,8 @@ public static class WayfarerApiHandler
             }
 
             await using var conn = integration.OpenReadOnlyConnection();
+            await AttachMetaDbAsync(conn, integration, ct).ConfigureAwait(false);
+
             var detail = await ReadDetailAsync(conn, woNo, ct).ConfigureAwait(false);
             if (detail is null)
             {
@@ -717,6 +727,8 @@ public static class WayfarerApiHandler
             }
 
             await using var conn = integration.OpenReadOnlyConnection();
+            await AttachMetaDbAsync(conn, integration, ct).ConfigureAwait(false);
+
             using var workbook = new XLWorkbook();
 
             var overviewRows = new List<WayfarerWorkOrderListItem>();
@@ -853,6 +865,9 @@ public static class WayfarerApiHandler
             WHERE role_type = 'maintenance_dept'
             GROUP BY wo_no
         ) md ON md.wo_no = i.wo_no
+        LEFT JOIN meta.meta_pu_branches mp ON CAST(mp.puNo AS TEXT) = CAST(i.pu_no AS TEXT)
+        LEFT JOIN meta.meta_equipment me ON CAST(me.eqNo AS TEXT) = CAST(i.eq_no AS TEXT)
+        LEFT JOIN meta.meta_departments mdp ON mdp.deptCode = i.dept_code
         """;
 
     private static string SelectList => """
@@ -860,11 +875,21 @@ public static class WayfarerApiHandler
                COALESCE(s.wo_status_code, i.wo_status_code) AS wo_status_code,
                s.wo_status_name,
                i.wo_type_code, i.eq_no, i.pu_no, i.dept_code,
-               t.task_name, t.pu_name, t.eq_name,
-               req.request_person_name, md.maintenance_dept_name,
+               t.task_name,
+               COALESCE(t.pu_name, mp.puName, CAST(i.pu_no AS TEXT)) AS pu_name,
+               COALESCE(t.eq_name, me.eqName, CAST(i.eq_no AS TEXT)) AS eq_name,
+               req.request_person_name,
+               COALESCE(md.maintenance_dept_name, mdp.deptName, i.dept_code) AS maintenance_dept_name,
                s.sch_start_d AS scheduled_start, s.sch_finish_d AS scheduled_finish, s.sch_duration AS scheduled_duration,
                s.act_start_d AS actual_start, s.act_finish_d AS actual_finish, s.act_duration AS actual_duration,
-               s.work_duration, s.dt_duration AS downtime_duration, s.complete_date,
+               COALESCE(
+                   s.work_duration,
+                   s.act_duration,
+                   s.sch_duration,
+                   CAST((julianday(s.act_finish_d) - julianday(s.act_start_d)) * 24 * 60 AS INTEGER),
+                   CAST((julianday(s.sch_finish_d) - julianday(s.sch_start_d)) * 24 * 60 AS INTEGER)
+               ) AS work_duration,
+               s.dt_duration AS downtime_duration, s.complete_date,
                i.fetched_at_utc
         """;
 
@@ -1113,22 +1138,78 @@ public static class WayfarerApiHandler
         FetchedAtUtc: GetString(r, "fetched_at_utc")
     );
 
+    private static async Task AttachMetaDbAsync(
+    SqliteConnection conn,
+    WayfarerIntegration integration,
+    CancellationToken ct)
+    {
+        await using var cmd = conn.CreateCommand();
+
+        cmd.CommandText = """
+        ATTACH DATABASE @metaPath AS meta
+        """;
+
+        cmd.Parameters.AddWithValue("@metaPath", integration.Options.MetaDbPath);
+
+        await cmd.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+    }
+
     private static async Task<IReadOnlyList<WayfarerStatusFilter>> ReadStatusFiltersAsync(SqliteConnection conn, CancellationToken ct)
     {
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT COALESCE(s.wo_status_code, i.wo_status_code) AS code,
-                   MAX(s.wo_status_name) AS name
-            FROM pm_wo_index i
-            LEFT JOIN pm_wo_schedule_status s ON s.wo_no = i.wo_no
-            WHERE COALESCE(s.wo_status_code, i.wo_status_code) IS NOT NULL
-            GROUP BY COALESCE(s.wo_status_code, i.wo_status_code)
-            ORDER BY CAST(COALESCE(s.wo_status_code, i.wo_status_code) AS INTEGER)
-            """;
+                        SELECT
+                            COALESCE(s.wo_status_code, i.wo_status_code) AS code,
+                            COALESCE(
+                                MAX(s.wo_status_name),
+                                CASE COALESCE(s.wo_status_code, i.wo_status_code)
+                                    WHEN '10' THEN 'แจ้งซ่อม'
+                                    WHEN '15' THEN 'รออนุมัติ'
+                                    WHEN '20' THEN 'รอดำเนินการ'
+                                    WHEN '30' THEN 'วางแผนแล้ว'
+                                    WHEN '50' THEN 'กำลังดำเนินการ'
+                                    WHEN '70' THEN 'งานเสร็จ/รอตรวจรับ'
+                                    WHEN '80' THEN 'ปิดงานแล้ว'
+                                    WHEN '99' THEN 'ยกเลิก'
+                                    ELSE 'Unknown'
+                                END
+                            ) AS name
+                        FROM pm_wo_index i
+                        LEFT JOIN pm_wo_schedule_status s ON s.wo_no = i.wo_no
+                        WHERE COALESCE(s.wo_status_code, i.wo_status_code) IS NOT NULL
+                          AND COALESCE(s.wo_status_code, i.wo_status_code) <> ''
+                        GROUP BY COALESCE(s.wo_status_code, i.wo_status_code)
+                        ORDER BY CAST(COALESCE(s.wo_status_code, i.wo_status_code) AS INTEGER)
+                        """;
         var list = new List<WayfarerStatusFilter>();
         await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
         while (await reader.ReadAsync(ct).ConfigureAwait(false))
             list.Add(new WayfarerStatusFilter(GetString(reader, "code"), GetString(reader, "name")));
+        return list;
+    }
+
+    private static async Task<IReadOnlyList<WayfarerTypeFilter>> ReadTypeFiltersAsync(
+    WayfarerIntegration integration,
+    CancellationToken ct)
+    {
+        await using var conn = integration.OpenReadOnlyMetaConnection();
+        await using var cmd = conn.CreateCommand();
+
+        cmd.CommandText = """
+        SELECT workClassShort AS code,
+               workClassName AS name
+        FROM meta_work_classes
+        WHERE workClassShort IS NOT NULL
+          AND workClassShort <> ''
+        ORDER BY workClassShort
+        """;
+
+        var list = new List<WayfarerTypeFilter>();
+
+        await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            list.Add(new WayfarerTypeFilter(GetString(reader, "code"), GetString(reader, "name")));
+
         return list;
     }
 
@@ -1454,3 +1535,4 @@ public static class WayfarerApiHandler
         resp.Headers["Access-Control-Allow-Headers"] = "Content-Type";
     }
 }
+
