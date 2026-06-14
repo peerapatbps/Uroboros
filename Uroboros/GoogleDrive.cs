@@ -33,6 +33,8 @@ namespace Uroboros
     // =========================================================
     internal static class DriveSyncCli
     {
+        public readonly record struct UploadResult(string RemoteFileName, bool UpdatedExisting);
+
         // 1) Upload file -> folder (Update if exists by SAME NAME, else Create)
         public static async Task UploadFileToSpecificFolderAsync(
             DriveService service,
@@ -83,7 +85,7 @@ namespace Uroboros
         }
 
         // 1b) Upload file -> folder BUT force remote name (สำคัญ: ชนะ lock โดยไม่แตะ data_ghost.db บนดิสก์)
-        public static async Task UploadFileToSpecificFolderAsNameAsync(
+        public static async Task<UploadResult> UploadFileToSpecificFolderAsNameAsync(
             DriveService service,
             string filePath,
             string folderId,
@@ -115,6 +117,7 @@ namespace Uroboros
                 updateRequest.Fields = "id";
                 updateRequest.SupportsAllDrives = true;
                 await updateRequest.UploadAsync(ct).ConfigureAwait(false);
+                return new UploadResult(remoteFileName, UpdatedExisting: true);
             }
             else
             {
@@ -128,6 +131,7 @@ namespace Uroboros
                 createRequest.Fields = "id";
                 createRequest.SupportsAllDrives = true;
                 await createRequest.UploadAsync(ct).ConfigureAwait(false);
+                return new UploadResult(remoteFileName, UpdatedExisting: false);
             }
         }
 
@@ -572,10 +576,10 @@ namespace Uroboros
                 throw new FileNotFoundException("snapshot temp not found (CreateSnapshotAsync did not produce it)", uploadTemp);
 
             var remoteName = Path.GetFileName(snapshotPath); // "data_ghost.db"
-            await DriveSyncCli.UploadFileToSpecificFolderAsNameAsync(service, uploadTemp, folderId, remoteName, ct)
+            var upload = await DriveSyncCli.UploadFileToSpecificFolderAsNameAsync(service, uploadTemp, folderId, remoteName, ct)
                 .ConfigureAwait(false);
 
-            ctx.Log.Info($"[DB] uploaded '{remoteName}' from '{uploadTemp}'");
+            ctx.Log.Info($"[DB] {(upload.UpdatedExisting ? "updated" : "created")} '{remoteName}' from '{uploadTemp}'");
         }
 
         private static void TryDelete(string path)

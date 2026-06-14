@@ -855,7 +855,7 @@ public sealed class PtcQueryOnceTask : IEngineTask
         try
         {
             // 1) fetch gensvg rel list (in-memory)
-            var commonUrl = "http://172.16.193.162/ptc/realtime/svgtest/common.php?NameSta=MH";
+            var commonUrl = "http://172.16.193.162/smartmap/station/ptc.php?st=MH";
             var srcList = await Uroboros.PTC.FetchEmbedSrcListAsync(commonUrl, ct).ConfigureAwait(false);
 
             if (srcList.Count == 0)
@@ -1524,6 +1524,11 @@ public sealed class DbUploadTask : IEngineTask
 // ==============================
 public sealed class DbDownloadTask : IEngineTask
 {
+    private readonly StageGate _gate;
+    private readonly Scheduler _sched;
+
+    public DbDownloadTask(StageGate gate, Scheduler sched) { _gate = gate; _sched = sched; }
+
     public TaskSpec Spec { get; } = new TaskSpec(
         Name: "DB_download.refresh",
         Group: "DB",
@@ -1576,46 +1581,81 @@ public sealed class DbDownloadTask : IEngineTask
             return;
         }
 
-        // 3) clear SQLite pools (Microsoft.Data.Sqlite)
-        try
-        {
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        }
-        catch { }
+        // 3+4) pause scheduler, drain running tasks, clear pools, swap file, restore attributes
+        _gate.Pause();
 
-        // 4) backup + atomic replace
+        // cancel every other running task except this one (CancelAll would cancel ourselves too)
+        foreach (var t in _sched.SnapshotRunning())
+            if (t.Name != Spec.Name)
+                _sched.Cancel(t.Id);
+
+        // drain: wait up to 5s for other tasks to finish — use CancellationToken.None so our own
+        // cancellation (from the foreach above potentially propagating) doesn't abort the wait
+        var drainDeadline = DateTime.UtcNow.AddSeconds(5);
+        while (_sched.SnapshotRunning().Any(t => t.Name != Spec.Name) && DateTime.UtcNow < drainDeadline)
+            await Task.Delay(100, CancellationToken.None).ConfigureAwait(false);
+
+        var stillRunning = _sched.SnapshotRunning().Where(t => t.Name != Spec.Name).ToList();
+        if (stillRunning.Count > 0)
+            ctx.Log.Warn($"[DB] drain timeout — {stillRunning.Count} task(s) still running: {string.Join(", ", stillRunning.Select(t => t.Name))} — proceeding with swap anyway");
+
         try
         {
-            if (File.Exists(targetDb))
+            // 3) clear SQLite pools (Microsoft.Data.Sqlite)
+            try
+            {
+                Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            }
+            catch { }
+
+            // 4) backup + atomic replace
+            try
+            {
+                if (File.Exists(targetDb))
+                {
+                    try
+                    {
+                        File.Copy(targetDb, backupDb, true);
+                    }
+                    catch { }
+
+                    File.Replace(tempDownload, targetDb, backupDb, ignoreMetadataErrors: true);
+                }
+                else
+                {
+                    File.Move(tempDownload, targetDb);
+                }
+
+                // 5) unset ReadOnly bit that Windows may inherit from temp file (preserve other attributes)
+                try
+                {
+                    var attrs = File.GetAttributes(targetDb);
+                    if ((attrs & FileAttributes.ReadOnly) != 0)
+                        File.SetAttributes(targetDb, attrs & ~FileAttributes.ReadOnly);
+                    ctx.Log.Info($"[DB] post-swap attr={File.GetAttributes(targetDb)}");
+                }
+                catch (Exception attrEx) { ctx.Log.Warn($"[DB] attr clear failed: {attrEx.Message}"); }
+
+                var ts = File.GetLastWriteTime(targetDb);
+                ctx.Log.Info($"[DB] download complete | file=data.db | localTs={ts:yyyy-MM-dd HH:mm:ss}");
+            }
+            catch (Exception ex)
+            {
+                ctx.Log.Error(ex, $"[DB] swap error: {ex.Message}");
+            }
+            finally
             {
                 try
                 {
-                    File.Copy(targetDb, backupDb, true);
+                    if (File.Exists(tempDownload))
+                        File.Delete(tempDownload);
                 }
                 catch { }
-
-                File.Replace(tempDownload, targetDb, backupDb, ignoreMetadataErrors: true);
             }
-            else
-            {
-                File.Move(tempDownload, targetDb);
-            }
-
-            var ts = File.GetLastWriteTime(targetDb);
-            ctx.Log.Info($"[DB] download complete | file=data.db | localTs={ts:yyyy-MM-dd HH:mm:ss}");
-        }
-        catch (Exception ex)
-        {
-            ctx.Log.Error(ex, $"[DB] swap error: {ex.Message}");
         }
         finally
         {
-            try
-            {
-                if (File.Exists(tempDownload))
-                    File.Delete(tempDownload);
-            }
-            catch { }
+            _gate.Resume();
         }
     }
 }
@@ -1634,6 +1674,7 @@ public sealed class MdbUploadTask : IEngineTask
     );
 
     private const string DriveFolderId = "1hLIPn9qgjqm4WliNJGsEwmjq78oaXFgm";
+    private const string DriveRemoteChemFileName = "chem.db";
 
     private const string ConfigFolderName = "config_";
     private const string ConfigFileName = "config.ini";
@@ -1702,7 +1743,7 @@ public sealed class MdbUploadTask : IEngineTask
         }
         catch (Exception ex)
         {
-            ctx.Log.Error(ex, $"❌ Convert MDB->chem.db failed: {ex.Message}");
+            ctx.Log.Error(ex, $"❌ Convert MDB->chem.db failed for '{mdbPath}': {ex.Message}");
             return;
         }
 
@@ -1736,11 +1777,19 @@ public sealed class MdbUploadTask : IEngineTask
             var fiChem = new FileInfo(chemDbPath);
             var sizeMbChem = fiChem.Length / 1024.0 / 1024.0;
 
-            await DriveSyncCli
-                .UploadFileToSpecificFolderAsync(service, chemDbPath, DriveFolderId, ct)
+            ctx.Log.Info($"[DRIVE] Upload source: {chemDbPath}");
+            ctx.Log.Info($"[DRIVE] Remote name: {DriveRemoteChemFileName}");
+
+            var upload = await DriveSyncCli
+                .UploadFileToSpecificFolderAsNameAsync(service, chemDbPath, DriveFolderId, DriveRemoteChemFileName, ct)
                 .ConfigureAwait(false);
 
-            ctx.Log.Info($"⬆️ Upload done: {fiChem.Name} ({sizeMbChem:F2} MB) @ {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            ctx.Log.Info(
+                upload.UpdatedExisting
+                    ? $"[DRIVE] Updated existing Drive file: {upload.RemoteFileName}"
+                    : $"[DRIVE] Created new Drive file: {upload.RemoteFileName}");
+
+            ctx.Log.Info($"⬆️ Upload done: {upload.RemoteFileName} ({sizeMbChem:F2} MB) @ {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         }
         catch (Google.GoogleApiException ex)
         {
@@ -2482,6 +2531,20 @@ public sealed class WebListener
                 return;
             }
 
+            if (req.HttpMethod == "GET" && path == "/admin/test/run")
+            {
+                try
+                {
+                    var report = Uroboros.SelfTest.SelfTestRunner.RunAll();
+                    await WriteJsonAsync(hc, 200, report);
+                }
+                catch (Exception testEx)
+                {
+                    await WriteJsonAsync(hc, 500, new { ok = false, error = testEx.Message });
+                }
+                return;
+            }
+
             await WriteJsonAsync(hc, 404, new { ok = false, error = "Not found", path });
         }
         catch (Exception ex)
@@ -2630,6 +2693,7 @@ public static class Program
         };
 
         var gate = new StageGate(startPaused: true);
+        Scheduler? sched = null; // assigned before any factory is invoked
 
         // NEW: health + nextRun
         var health = new TaskHealthTracker();
@@ -2651,11 +2715,12 @@ public static class Program
         reg.Register("Aquadat.refresh", () => new AquadatQueryTask());
         reg.Register("AquadatFWS.refresh", () => new AquadatFwsQueryTask());
         reg.Register("DB_upload.refresh", () => new DbUploadTask());
-        reg.Register("DB_download.refresh", () => new DbDownloadTask());
+        reg.Register("DB_download.refresh", () => new DbDownloadTask(gate, sched!));
         reg.Register("MDB_upload.refresh", () => new MdbUploadTask());
         reg.Register("MDB_download.refresh", () => new MdbDownloadTask());
         reg.Register("LAB.import.daily", () => new LabImportTask());
         reg.Register(WayfarerConstants.TaskName, () => new WayfarerPmCollectTask(wayfarer));
+        reg.Register("openclaw.trigger", () => new OpenClawTriggerTask());
 
         // NEW: config store/service
         var adminDb = Path.Combine(AppContext.BaseDirectory, "engine_admin.db");
@@ -2679,10 +2744,11 @@ public static class Program
             ("AquadatFWS.refresh", () => new AquadatFwsQueryTask(), 30000),// 5 นาที
             ("DB_upload.refresh", () => new DbUploadTask(), 30000),
             ("MDB_upload.refresh", () => new MdbUploadTask(), 30000),
-            ("DB_download.refresh", () => new DbUploadTask(), 30000),
+            ("DB_download.refresh", (Func<IEngineTask>)(() => new DbDownloadTask(gate, sched!)), 30000),
             ("MDB_download.refresh", () => new MdbDownloadTask(), 30000),
             ("LAB.import.daily", () => new LabImportTask(), 30000), // 24 ชม.
-            (WayfarerConstants.TaskName, () => new WayfarerPmCollectTask(wayfarer), WayfarerConstants.DefaultIntervalMs)
+            (WayfarerConstants.TaskName, () => new WayfarerPmCollectTask(wayfarer), WayfarerConstants.DefaultIntervalMs),
+            ("openclaw.trigger", () => new OpenClawTriggerTask(), 300_000) // ทุก 5 นาที
         };
 
         using var stopCts = new CancellationTokenSource();
@@ -2696,7 +2762,7 @@ public static class Program
             ct: stopCts.Token);
 
         // Scheduler with per-task gate (enabled)
-        var sched = new Scheduler(
+        sched = new Scheduler(
             ctx,
             maxConcurrency: 20,
             gate: gate,

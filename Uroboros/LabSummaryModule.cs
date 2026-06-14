@@ -158,7 +158,12 @@ public static class LabSummaryModule
         if (best.HasValue)
             return nowLocal.Date.AddHours(best.Value);
 
-        return nowLocal.Date.AddDays(-1).AddHours(firstHour);
+        // ก่อนถึง firstHour ของวันนี้ → anchor ควรเป็น step สุดท้ายของเมื่อวาน
+        // ไม่ใช่ firstHour ของเมื่อวาน (จะดึงแค่ 01:00 เดียว แทนที่จะเป็น 23:00)
+        var lastStep = firstHour;
+        for (var h = firstHour; h < 24; h += stepHours)
+            lastStep = h;
+        return nowLocal.Date.AddDays(-1).AddHours(lastStep);
     }
 
     private static int? GetLatestFourHourAnchorHour(DateTime nowLocal)

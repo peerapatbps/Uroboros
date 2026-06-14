@@ -1011,7 +1011,12 @@ CREATE INDEX IF NOT EXISTS idx_ovs_updated    ON OneValueSeries(updated_at);
                 // ห้ามเรียก EnsureInit ที่นี่ (กัน recursion)
                 if (!_initialized)
                     throw new InvalidOperationException("SingleValueDb not initialized. Call EnsureInit(dbPath) first.");
-                return new SqliteConnection(_connStr);
+                var conn = new SqliteConnection(_connStr);
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "PRAGMA busy_timeout=5000;";
+                cmd.ExecuteNonQuery();
+                return conn;
             }
 
             // ===================== Current (OneValuemetrics) =====================
@@ -1022,7 +1027,6 @@ CREATE INDEX IF NOT EXISTS idx_ovs_updated    ON OneValueSeries(updated_at);
 
                 var updatedAt = TimeUtil.ToThaiIso(tsUtc);
                 using var conn = NewConn();
-                conn.Open();
 
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = @"
@@ -1066,7 +1070,6 @@ ON CONFLICT(source, key) DO UPDATE SET
                 // 1) ลบของเก่าเฉพาะ source/key
                 using (var connDel = NewConn())
                 {
-                    await connDel.OpenAsync(ct).ConfigureAwait(false);
                     using var cmdDel = connDel.CreateCommand();
                     cmdDel.CommandText = "DELETE FROM OneValueSeries WHERE source = $s AND key = $k;";
                     cmdDel.Parameters.AddWithValue("$s", source);
@@ -1092,7 +1095,6 @@ ON CONFLICT(source, key) DO UPDATE SET
                 var updatedAt = TimeUtil.ToThaiIso(); // เวลาไทยของรอบนี้
 
                 using var conn = NewConn();
-                await conn.OpenAsync(ct).ConfigureAwait(false);
 
                 using var tx = conn.BeginTransaction();
                 using var cmd = conn.CreateCommand();

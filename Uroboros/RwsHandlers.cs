@@ -76,7 +76,7 @@ namespace Uroboros
                     throw new InvalidOperationException($"db not found: {dbPath}");
 
                 var nowLocal = DateTime.Now;
-                var targetHour = nowLocal.Hour; // AQ pick HH:00:00
+                var targetHour = nowLocal.Hour & ~1; // AQ pick even hour HH:00:00 (same rule as CHEM)
                 await using var conn = new SqliteConnection($"Data Source={dbPath};Mode=ReadOnly;Cache=Shared;Pooling=True;");
                 await conn.OpenAsync(ct).ConfigureAwait(false);
 

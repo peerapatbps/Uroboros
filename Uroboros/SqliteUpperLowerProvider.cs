@@ -17,6 +17,7 @@ public sealed class SqliteUpperLowerProvider : IPtcSeriesProvider
 {
     private readonly string _dbPath;
     private readonly string _cs;
+    private bool? _hasUpperLowerTable;
 
     public SqliteUpperLowerProvider(string dbPath)
     {
@@ -33,6 +34,7 @@ public sealed class SqliteUpperLowerProvider : IPtcSeriesProvider
     public IReadOnlyList<string> ListKeys()
     {
         if (!File.Exists(_dbPath)) return Array.Empty<string>();
+        if (!HasUpperLowerTable()) return Array.Empty<string>();
 
         using var con = new SqliteConnection(_cs);
         con.Open();
@@ -55,6 +57,7 @@ public sealed class SqliteUpperLowerProvider : IPtcSeriesProvider
         key = (key ?? "").Trim();
         if (key.Length == 0) return Array.Empty<PtcPoint>();
         if (!File.Exists(_dbPath)) return Array.Empty<PtcPoint>();
+        if (!HasUpperLowerTable()) return Array.Empty<PtcPoint>();
 
         using var con = new SqliteConnection(_cs);
         con.Open();
@@ -109,5 +112,32 @@ ORDER BY hhmm;";
         }
 
         return list;
+    }
+
+    private bool HasUpperLowerTable()
+    {
+        if (_hasUpperLowerTable.HasValue) return _hasUpperLowerTable.Value;
+
+        try
+        {
+            using var con = new SqliteConnection(_cs);
+            con.Open();
+
+            using var cmd = con.CreateCommand();
+            cmd.CommandText = @"
+SELECT 1
+FROM sqlite_master
+WHERE type = 'table'
+  AND name = 'upper_lower'
+LIMIT 1;";
+
+            _hasUpperLowerTable = cmd.ExecuteScalar() is not null;
+        }
+        catch
+        {
+            _hasUpperLowerTable = false;
+        }
+
+        return _hasUpperLowerTable.Value;
     }
 }

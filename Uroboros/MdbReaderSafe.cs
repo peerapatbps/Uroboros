@@ -195,7 +195,7 @@ namespace Uroboros
             {
                 ct.ThrowIfCancellationRequested();
 
-                MdbToSqliteConverter.ConvertToChemSqlite(mdbPath, tempChem);
+                MdbToSqliteConverter.ConvertToChemSqlite(mdbPath, tempChem, ctx?.Log);
 
                 SqliteConnection.ClearAllPools();
 
@@ -210,6 +210,11 @@ namespace Uroboros
 
                 ctx?.Log?.Info($"[MDB] Convert OK: active chem snapshot updated (stamp={mdbStamp})");
                 return true;
+            }
+            catch (Exception ex)
+            {
+                ctx?.Log?.Error(ex, $"[MDB] Convert failed for '{mdbPath}'");
+                throw;
             }
             finally
             {
@@ -505,7 +510,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_PRODUCT  ON WDATA(PRODUCT);
 CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
 ";
 
-        public static void ConvertToChemSqlite(string mdbPath, string sqlitePath)
+        public static void ConvertToChemSqlite(string mdbPath, string sqlitePath, ILogger? log = null)
         {
             if (!File.Exists(mdbPath))
                 throw new FileNotFoundException("MDB not found.", mdbPath);
@@ -530,17 +535,17 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             ExecNonQuery(sqlite, "DELETE FROM COMPANY;", tx);
             ExecNonQuery(sqlite, "DELETE FROM CARTYPE;", tx);
 
-            CopyTable_PRODUCT(mdbPath, sqlite, tx);
-            CopyTable_COMPANY(mdbPath, sqlite, tx);
-            CopyTable_CARTYPE(mdbPath, sqlite, tx);
-            CopyTable_WDATA(mdbPath, sqlite, tx);
+            CopyTable_PRODUCT(mdbPath, sqlite, tx, log);
+            CopyTable_COMPANY(mdbPath, sqlite, tx, log);
+            CopyTable_CARTYPE(mdbPath, sqlite, tx, log);
+            CopyTable_WDATA(mdbPath, sqlite, tx, log);
 
             tx.Commit();
 
             SqliteConnection.ClearAllPools();
         }
 
-        private static void CopyTable_PRODUCT(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx)
+        private static void CopyTable_PRODUCT(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx, ILogger? log)
         {
             const string sql = "SELECT CODE, NAME FROM PRODUCT";
             using var insert = sqlite.CreateCommand();
@@ -549,7 +554,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             var pc = AddP(insert, "$c");
             var pn = AddP(insert, "$n");
 
-            StreamMdbRows(mdbPath, sql, null, rec =>
+            StreamMdbRows(mdbPath, sql, null, log, rec =>
             {
                 pc.Value = SafeText(rec, 0);
                 pn.Value = SafeText(rec, 1);
@@ -557,7 +562,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             });
         }
 
-        private static void CopyTable_COMPANY(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx)
+        private static void CopyTable_COMPANY(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx, ILogger? log)
         {
             const string sql = "SELECT CODE, NAME FROM COMPANY";
             using var insert = sqlite.CreateCommand();
@@ -566,7 +571,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             var pc = AddP(insert, "$c");
             var pn = AddP(insert, "$n");
 
-            StreamMdbRows(mdbPath, sql, null, rec =>
+            StreamMdbRows(mdbPath, sql, null, log, rec =>
             {
                 pc.Value = SafeText(rec, 0);
                 pn.Value = SafeText(rec, 1);
@@ -574,7 +579,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             });
         }
 
-        private static void CopyTable_CARTYPE(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx)
+        private static void CopyTable_CARTYPE(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx, ILogger? log)
         {
             const string sql = "SELECT CODE, NAME FROM CARTYPE";
             using var insert = sqlite.CreateCommand();
@@ -583,7 +588,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             var pc = AddP(insert, "$c");
             var pn = AddP(insert, "$n");
 
-            StreamMdbRows(mdbPath, sql, null, rec =>
+            StreamMdbRows(mdbPath, sql, null, log, rec =>
             {
                 pc.Value = SafeText(rec, 0);
                 pn.Value = SafeText(rec, 1);
@@ -591,7 +596,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             });
         }
 
-        private static void CopyTable_WDATA(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx)
+        private static void CopyTable_WDATA(string mdbPath, SqliteConnection sqlite, SqliteTransaction tx, ILogger? log)
         {
             const string sql =
                 "SELECT STAT, TRUCK, CARTYPE, COMPANY, PRODUCT, DAYIN, TMIN, W1, DAYOUT, TMOUT, W2 " +
@@ -615,7 +620,7 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             var p9 = AddP(insert, "$tmout");
             var p10 = AddP(insert, "$w2");
 
-            StreamMdbRows(mdbPath, sql, null, rec =>
+            StreamMdbRows(mdbPath, sql, null, log, rec =>
             {
                 p0.Value = SafeText(rec, 0);
                 p1.Value = SafeText(rec, 1);
@@ -693,9 +698,10 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
             string mdbPath,
             string sql,
             List<OleDbParameter>? paramsInOrder,
+            ILogger? log,
             Action<IDataRecord> rowHandler)
         {
-            using var conn = OpenMdb(mdbPath);
+            using var conn = OpenMdb(mdbPath, log);
             using var cmd = new OleDbCommand(sql, conn);
 
             if (paramsInOrder is { Count: > 0 })
@@ -708,31 +714,74 @@ CREATE INDEX IF NOT EXISTS IX_WDATA_COMPANY  ON WDATA(COMPANY);
                 rowHandler(r);
         }
 
-        private static OleDbConnection OpenMdb(string mdbPath)
+        private static IEnumerable<string> BuildMdbConnectionStrings(string mdbPath)
         {
-            var providers = new[]
-            {
-                "Microsoft.ACE.OLEDB.16.0",
-                "Microsoft.ACE.OLEDB.12.0",
-                "Microsoft.Jet.OLEDB.4.0"
-            };
+            yield return $"Provider=Microsoft.ACE.OLEDB.16.0;Data Source={mdbPath};Persist Security Info=False;";
+            yield return $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={mdbPath};Persist Security Info=False;";
+
+            if (!Environment.Is64BitProcess)
+                yield return $"Provider=Microsoft.Jet.OLEDB.4.0;Data Source={mdbPath};Persist Security Info=False;";
+        }
+
+        private static OleDbConnection OpenMdb(string mdbPath, ILogger? log = null)
+        {
+            log?.Info($"[MDB] Opening MDB '{mdbPath}' (process={(Environment.Is64BitProcess ? "x64" : "x86")})");
 
             Exception? lastEx = null;
-            foreach (var prov in providers)
+            var errors = new List<string>();
+
+            foreach (var cs in BuildMdbConnectionStrings(mdbPath))
             {
+                var provider = ExtractProviderName(cs);
+                log?.Info($"[MDB] Trying OLE DB provider '{provider}' for '{mdbPath}'");
+
+                OleDbConnection? conn = null;
                 try
                 {
-                    var cs = $"Provider={prov};Data Source={mdbPath};Persist Security Info=False;";
-                    var conn = new OleDbConnection(cs);
+                    conn = new OleDbConnection(cs);
                     conn.Open();
+                    log?.Info($"[MDB] Using OLE DB provider '{provider}' for '{mdbPath}'");
                     return conn;
                 }
-                catch (Exception ex) { lastEx = ex; }
+                catch (Exception ex)
+                {
+                    conn?.Dispose();
+                    lastEx = ex;
+                    errors.Add($"{provider}: {ex.Message}");
+                    log?.Warn($"[MDB] Provider '{provider}' failed for '{mdbPath}': {ex.Message}");
+                }
             }
 
-            throw new InvalidOperationException(
-                "Failed to open MDB for conversion: " + (lastEx?.Message ?? "unknown"),
-                lastEx);
+            var message = BuildNoProviderMessage(mdbPath, errors);
+            var wrapped = new InvalidOperationException(message, lastEx);
+            log?.Error(wrapped, $"[MDB] No supported OLE DB provider could open '{mdbPath}'");
+            throw wrapped;
+        }
+
+        private static string ExtractProviderName(string connectionString)
+        {
+            const string key = "Provider=";
+            var start = connectionString.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+            if (start < 0) return "(unknown)";
+
+            start += key.Length;
+            var end = connectionString.IndexOf(';', start);
+            return end >= 0
+                ? connectionString.Substring(start, end - start)
+                : connectionString.Substring(start);
+        }
+
+        private static string BuildNoProviderMessage(string mdbPath, List<string> errors)
+        {
+            var providerList = "Microsoft.ACE.OLEDB.16.0, Microsoft.ACE.OLEDB.12.0";
+            var detail = errors.Count == 0 ? "No provider attempts were recorded." : string.Join(" | ", errors);
+            var jetNote = Environment.Is64BitProcess
+                ? " Jet 4.0 was not attempted because this process is 64-bit."
+                : " Jet 4.0 was attempted as an x86 fallback.";
+
+            return
+                $"Unable to open MDB '{mdbPath}'. Install the Microsoft Access Database Engine (ACE OLEDB) 64-bit provider on this server and retry. " +
+                $"Providers attempted: {providerList}.{jetNote} Errors: {detail}";
         }
     }
 
